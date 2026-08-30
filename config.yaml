@@ -1,0 +1,41 @@
+# Local-testing config ONLY. Read the "Production config" section of
+# README.md before assuming any of this ships as-is.
+#
+# In production, Orchestra's runner never renders this file's connection
+# block at all — it exports SQLMesh's native SQLMESH__GATEWAYS__... env vars
+# (verified end-to-end in orchestra/docs/RECON-sqlmesh.md §4) mapped from
+# ORCHESTRA_WAREHOUSE_*, and those are merged on top of whatever is here.
+# This file exists so a developer can point the project at a scratch
+# Postgres database on their own machine with zero templating.
+#
+# env_var() falls back to the given default so `sqlmesh` works out of the
+# box against a local Postgres reachable with no password; override any of
+# these by exporting the same-named variable before running sqlmesh, e.g.
+#   export PGDATABASE=sqlmesh_fixture_12345
+gateways:
+  postgres:
+    connection:
+      type: postgres
+      host: {{ env_var('PGHOST', 'localhost') }}
+      port: {{ env_var('PGPORT', 5432) }}
+      user: {{ env_var('PGUSER', 'postgres') }}
+      password: "{{ env_var('PGPASSWORD', '') }}"
+      database: {{ env_var('PGDATABASE', 'orchestra_sqlmesh_local') }}
+    # Same database, dedicated schema — exactly the shape decision 1 of
+    # SCOPE-runner-sqlmesh.md specifies for production, just pointed at a
+    # local scratch database instead of a customer warehouse.
+    state_connection:
+      type: postgres
+      host: {{ env_var('PGHOST', 'localhost') }}
+      port: {{ env_var('PGPORT', 5432) }}
+      user: {{ env_var('PGUSER', 'postgres') }}
+      password: "{{ env_var('PGPASSWORD', '') }}"
+      database: {{ env_var('PGDATABASE', 'orchestra_sqlmesh_local') }}
+    state_schema: sqlmesh_state
+
+default_gateway: postgres
+
+model_defaults:
+  dialect: postgres
+  start: 2026-08-20
+  cron: "@daily"
