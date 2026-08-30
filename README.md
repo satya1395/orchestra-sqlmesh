@@ -108,13 +108,19 @@ database* — never in Orchestra's control plane. The two gateway keys that matt
 `sqlmesh_state` schema is silent and non-interactive, creating exactly six tables (`_snapshots`,
 `_intervals`, `_environments`, `_versions`, `_environment_statements`, `_auto_restatements`).
 
-**Default job commands** (orchestrator decision, dbt-parity rationale — every scheduled run does the
-dbt-`build`-equivalent of both applying pending changes and running what's due, not just the
-latter):
+**Default job commands**: `["sqlmesh run"]`. An earlier draft seeded scheduled jobs with
+plan+run on a dbt-parity argument; review reversed it — unattended `plan --auto-apply` promotes
+snapshot versions, can rebuild tables on breaking changes, and backfills historical intervals,
+which a scheduled `dbt build` never does (the platform's scope doc, decision 2, records the full
+reversal). A **new** project therefore needs a one-time bootstrap before its first scheduled run
+(see VERIFY 2 below — an unplanned `sqlmesh run` fails with "Environment 'prod' was not found"):
 
 ```
-["sqlmesh plan --no-prompts --auto-apply prod", "sqlmesh run"]
+sqlmesh plan --no-prompts --auto-apply prod
 ```
+
+Run it once as a manual job command, then remove it. The platform's job form shows this same
+signpost for SQLMesh projects.
 
 ## Verified
 
