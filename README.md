@@ -72,29 +72,49 @@ deactivate && rm -rf .venv
 `config.yaml` here is for this local convenience only — see the next section for what production
 actually does.
 
-## Production config: no config file at all
+## Production config: your repo still ships `config.yaml` — the platform overrides the connection half
 
-In production, Orchestra's runner **never renders this project's `config.yaml`**. Per
-`SCOPE-runner-sqlmesh.md` decision 1 and `RECON-sqlmesh.md` §4, SQLMesh state lives in a dedicated
-schema (`sqlmesh_state`, per project) of the *customer's own warehouse database* — never in
-Orchestra's control plane — reached entirely through SQLMesh's native environment-variable config
-layer:
+Correction from an earlier draft of this README: **the runner image does not ship a static
+`config.yaml`.** The image ships only `entrypoint.sh` and the `sqlmesh_report.py` report emitter —
+nothing that could stand in for a project's own config. SQLMesh requires `model_defaults.dialect`
+to be set *somewhere*, and nothing in the runner validates or supplies it, so **every SQLMesh
+project deployed on Orchestra must carry its own `config.yaml` with `model_defaults` (`dialect` at
+minimum) committed in the repo** — exactly like this fixture's own `config.yaml` does.
+
+**Requirements for your repo:** commit a `config.yaml` with at least `model_defaults.dialect` set.
+You may also declare `gateways`/`default_gateway` for local development (as this fixture does), but
+know that in production those connection-shaped values are overridden, not read — see below.
+
+What the platform *does* override, entirely through SQLMesh's native environment-variable config
+layer (no Jinja templating step, no generated `profiles.yml`-equivalent, unlike the dbt path) — per
+`SCOPE-runner-sqlmesh.md` decision 1 and `RECON-sqlmesh.md` §4 — is the connection and state half of
+the gateway, plus which gateway is authoritative:
 
 ```
+SQLMESH__DEFAULT_GATEWAY
 SQLMESH__GATEWAYS__<gateway>__CONNECTION__*
 SQLMESH__GATEWAYS__<gateway>__STATE_CONNECTION__*
 SQLMESH__GATEWAYS__<gateway>__STATE_SCHEMA
 ```
 
-The entrypoint maps `ORCHESTRA_WAREHOUSE_*` to those names directly — no Jinja templating step, no
-generated `profiles.yml`-equivalent, unlike the dbt path. The image ships a static `config.yaml`
-containing only `default_gateway` and `model_defaults` (fixed at build time, no secrets); the
-env-var layer is merged on top of that at every invocation. The two config keys that matter are
-exactly `state_connection` and `state_schema` — confirmed real, exact names, in
-`sqlmesh/core/config/gateway.py` (`RECON-sqlmesh.md` §4) — and bootstrapping a brand-new,
-empty `sqlmesh_state` schema is silent and non-interactive, creating exactly six tables
-(`_snapshots`, `_intervals`, `_environments`, `_versions`, `_environment_statements`,
-`_auto_restatements`).
+The entrypoint exports `SQLMESH__DEFAULT_GATEWAY` naming the gateway it's about to configure and
+maps `ORCHESTRA_WAREHOUSE_*` to the `CONNECTION`/`STATE_CONNECTION`/`STATE_SCHEMA` keys above — this
+is what makes the platform's chosen gateway authoritative over whatever `default_gateway` (or
+however many other gateways) the repo's own `config.yaml` declares, confirmed live below. SQLMesh
+state lives in a dedicated schema (`sqlmesh_state`, per project) of the *customer's own warehouse
+database* — never in Orchestra's control plane. The two gateway keys that matter are exactly
+`state_connection` and `state_schema` — confirmed real, exact names, in
+`sqlmesh/core/config/gateway.py` (`RECON-sqlmesh.md` §4) — and bootstrapping a brand-new, empty
+`sqlmesh_state` schema is silent and non-interactive, creating exactly six tables (`_snapshots`,
+`_intervals`, `_environments`, `_versions`, `_environment_statements`, `_auto_restatements`).
+
+**Default job commands** (orchestrator decision, dbt-parity rationale — every scheduled run does the
+dbt-`build`-equivalent of both applying pending changes and running what's due, not just the
+latter):
+
+```
+["sqlmesh plan --no-prompts --auto-apply prod", "sqlmesh run"]
+```
 
 ## Verified
 
@@ -214,3 +234,101 @@ recommendation — not count rows in `_intervals`.
 No other divergence from `RECON-sqlmesh.md` was found: exit codes, the plan/run console text shape,
 the six bootstrapped state tables, the `state_connection`/`state_schema` config keys, and the
 `SQLMESH__GATEWAYS__...` env-var merge behavior all matched exactly as documented.
+
+### Review-round follow-ups, also run live
+
+Two more things a review round flagged as unverified inference rather than checked fact. Both were
+run against fresh throwaway Postgres databases (`sqlmesh_fixture_45185`, `_45185_b`, `_45185_c` —
+all `createdb`'d and `dropdb`'d for this session only; `orchestra_app` untouched, no AWS calls), same
+venv/`sqlmesh[postgres]==0.236.1` pin as above.
+
+**VERIFY 1 — does `SQLMESH__DEFAULT_GATEWAY` actually override a repo `config.yaml` whose
+`default_gateway` names a different, working gateway?** This is the load-bearing claim behind "the
+platform's chosen gateway wins over the repo's" above, so it needed the adversarial case, not just
+the merge-behavior recon already confirmed for leaf keys. Built a throwaway project with **two**
+fully-working Postgres gateways in one `config.yaml`:
+
+```yaml
+gateways:
+  gw_a: { connection: {... database: sqlmesh_fixture_45185 ...}, state_schema: sqlmesh_state_gw_a }
+  gw_b: { connection: {... database: sqlmesh_fixture_45185_b ...}, state_schema: sqlmesh_state_gw_b }
+default_gateway: gw_a
+```
+
+Baseline, no env var — `sqlmesh plan --no-prompts --auto-apply prod` uses `gw_a` as the config
+declares:
+
+```
+$ sqlmesh plan --no-prompts --auto-apply prod
+Initializing new project state...
+**`prod` environment will be initialized**
+...
+Virtual layer updated
+$ echo $?
+0
+```
+
+```
+$ psql -d sqlmesh_fixture_45185   -c '\dn'   # gw_a's db: populated
+marts | raw | staging | sqlmesh__marts | sqlmesh__raw | sqlmesh__staging | sqlmesh_state_gw_a
+$ psql -d sqlmesh_fixture_45185_b -c '\dn'   # gw_b's db: empty (only "public")
+public
+```
+
+Adversarial case — same project, same `config.yaml` (still `default_gateway: gw_a`), but
+`SQLMESH__DEFAULT_GATEWAY=gw_b` exported before the identical command:
+
+```
+$ SQLMESH__DEFAULT_GATEWAY=gw_b sqlmesh plan --no-prompts --auto-apply prod
+Initializing new project state...
+**`prod` environment will be initialized**
+...
+Virtual layer updated
+$ echo $?
+0
+```
+
+```
+$ psql -d sqlmesh_fixture_45185   -c '\dn'   # gw_a's db: UNCHANGED from before
+marts | raw | staging | sqlmesh__marts | sqlmesh__raw | sqlmesh__staging | sqlmesh_state_gw_a
+$ psql -d sqlmesh_fixture_45185_b -c '\dn'   # gw_b's db: NOW populated
+marts | raw | staging | sqlmesh__marts | sqlmesh__raw | sqlmesh__staging | sqlmesh_state_gw_b
+```
+
+**Result: confirmed, unambiguously.** `SQLMESH__DEFAULT_GATEWAY=gw_b` won over the repo's
+`default_gateway: gw_a` — the entire plan (schemas, tables, state) landed in `gw_b`'s database
+(`sqlmesh_fixture_45185_b`, schema `sqlmesh_state_gw_b`) instead of `gw_a`'s, and `gw_a`'s database
+from the baseline run was left completely untouched by the second invocation. This is exactly what
+lets the platform's `ORCHESTRA_WAREHOUSE_*`-derived gateway be authoritative regardless of what a
+repo's own `config.yaml` declares as its default — no divergence from expectation here.
+
+**VERIFY 2 — what does `sqlmesh run prod` do against a project whose state schema has never had
+`plan` applied?** This decides how the platform's very-first-run failure reads if a job's `run` step
+somehow executes before its `plan` step (misconfiguration, race, or a `plan` that errored out
+without the operator noticing). Fresh scratch database (`sqlmesh_fixture_45185_c`), this fixture's
+real single-gateway `config.yaml`, **no prior `plan` invocation of any kind**:
+
+```
+$ sqlmesh run prod
+Initializing new project state...
+Error: Environment 'prod' was not found.
+$ echo $?
+1
+```
+
+**Result: exit 1, message `Error: Environment 'prod' was not found.`** — a clean, immediate,
+human-readable failure naming the actual problem (no environment has ever been promoted), not a
+hang, a silent no-op, or a stack trace. One nuance worth carrying into the entrypoint/ingest design:
+SQLMesh still bootstraps the **state schema itself** before hitting that error —
+
+```
+$ psql -d sqlmesh_fixture_45185_c -c '\dt sqlmesh_state.*'
+_auto_restatements | _environment_statements | _environments | _intervals | _snapshots | _versions
+```
+
+— all six tables exist, empty, even though the command failed. So "state schema exists" is not
+proof a project was ever successfully planned; only a promoted environment is. This matches the
+"`run` never silently does the `plan`'s job" behavior `RECON-sqlmesh.md` §2 already established
+(editing a model and calling `run` without an intervening `plan` has zero effect) — here extended to
+the more extreme case of *no* environment existing at all — so no divergence from what the recon's
+overall model of `run` would predict, just a fact the recon didn't explicitly execute.
