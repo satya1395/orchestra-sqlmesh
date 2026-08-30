@@ -15,5 +15,6 @@ select
     min(event_date) as first_date,
     max(event_date) as last_date,
     sum(pageviews) as total_pageviews,
-    round(avg(active_users), 2) as avg_daily_active_users
+    round(avg(active_users), 2) as avg_daily_active_users,
+    max(active_users) as peak_daily_active_users
 from marts.daily_active_users
